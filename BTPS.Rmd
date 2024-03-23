@@ -1,0 +1,503 @@
+---
+title: "BTPS"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Initialize
+```{r}
+library(mgcv)
+library(patchwork)
+```
+
+```{r}
+option_type <- 'call'
+knots_K <- 3
+degree_m <- 3
+```
+
+
+## Load
+```{r}
+# option data
+df_real_merge_trans_f <- readRDS(file="F:/research/option_data.Rda")
+df_real_merge_trans_f_call <-
+  df_real_merge_trans_f %>% filter(call_or_put == 'C')
+df_real_merge_trans_f_put <-
+  df_real_merge_trans_f %>% filter(call_or_put == 'P')
+
+if(option_type == 'call'){
+  df_real_merge_trans_f_s <- df_real_merge_trans_f_call
+}else{
+  df_real_merge_trans_f_s <- df_real_merge_trans_f_put
+}
+
+# predicted alpha (python output)
+my_files_alpha <- list.files(path="F:/research/pred_alpha_call", pattern = "\\.csv$")
+my_files_alpha <- mixedsort(my_files_alpha)
+
+alpha_pred_df_l <- lapply(my_files_alpha, function(x) read.csv(paste0('F:/research/pred_alpha_call/',x)))
+alpha_pred_df <- alpha_pred_df_l %>% reduce(left_join, by = 'trade_date')
+names(alpha_pred_df) <- c('trade_date', paste0("alpha", 1:13)) #  %>% sort()-> different from the 4 curves data
+```
+
+
+## Functions
+
+### fitBTPS_zc_unnorm_test2_v2
+```{r}
+# This function is for real data, when if_pred_new = TRUE, it is predicting the out-of-sample surface
+# version of fitBTPS_zc() with unnormalized moneyness, input x is unnormalized moneyness
+# xz, penalty_bool: no use
+fitBTPS_zc_unnorm_test2_v2<-function(y,x,z,xz,knots=c(0,0),
+                                     degree=c(5,3), penalty=c(1,1), tol1st=.0000001, tol2nd=.1,
+                                     degree.sd=c(3,3), penalty.sd=c(1,1),
+                                     newXLim=c(min(x),max(x)), newZLim=c(min(z), max(z)), new_X_Z_grid = c(100, 50),
+                                     nonDeg=FALSE, penalty_bool=TRUE,if_pred_new = TRUE){
+  
+  ##Get a value for the number of B-spline Basis needed for the set up based on degree and knots
+  myK<-c(knots+degree+1)  # for s(bs = "bs") setup:
+  #https://stat.ethz.ch/R-manual/R-patched/library/mgcv/html/smooth.construct.bs.smooth.spec.html 
+  ##create the degree and penalty list for the function
+  m<-degree # for s(bs = 'bs')
+  
+  ##fit the BTPS using the gam function in r
+  if(penalty_bool == TRUE){
+    #theFit <- gam(y~s(x, k = myK, m = m, bs = "bs") + s(z, k = myK, m = m, bs="bs"), drop.intercept=F)
+    theFit <- gam(y~s(x, k = myK, m = m, bs = "bs")+s(z, k = myK, m = m, bs = "bs"), drop.intercept=F)
+  }else{}
+  
+  if(if_pred_new == TRUE){
+    ###create new data and fit the new data
+    xNew_unnorm<-seq(newXLim[1],newXLim[2],length.out = new_X_Z_grid[1])
+    ##values of length.out might not work on all computers due to memory limitations
+    zNew<-seq(newZLim[1],newZLim[2],by = 1/new_X_Z_grid[2]) # this specification is used so that we can plot 2D plot on exact ptmday
+    
+    hold.dataframe<-expand.grid(xNew_unnorm,zNew)
+    
+    xNew_unnorm<-hold.dataframe$Var1
+    # normalization 
+    # xNew <- (xNew_unnorm - X_norm_stats[1]) / X_norm_stats[2]
+    zNew<-hold.dataframe$Var2
+
+    Fit<-as.numeric(predict(theFit,data.frame(x=xNew_unnorm,z=zNew))) # use ptmday_frac now for both simu and real data
+
+    # For the purpose of getting model matrix for the fine grids
+    theFit_new <- gam(Fit~s(xNew_unnorm, k = myK, m = m, bs = "bs") + s(zNew, k = myK, m = m, bs="bs"), drop.intercept=F)
+  }
+  
+  # prediction of the original data (insample)
+  yPred<-as.numeric(predict(theFit,data.frame(x=x,z=z)))
+  
+  # ##Estimate the First derivative fit
+  # Derv1Fit<--(predict(theFit,data.frame(x=xNew_unnorm,z=zNew))-predict(theFit,data.frame(x=xNew_unnorm+tol1st,z=zNew)))/tol1st
+  # 
+  # ##Estimate the Second derivative fit
+  # Derv2Fit<-(predict(theFit,data.frame(x=xNew_unnorm-tol2nd,z=zNew))-2*predict(theFit,data.frame(x=xNew_unnorm,z=zNew))+predict(theFit,data.frame(x=xNew_unnorm+tol2nd,z=zNew)))/tol2nd^2
+  # # browser()
+  # Derv2FitNonNeg<-NA
+  
+  ##Ensure the fit is positive
+  if(nonDeg){
+    number<-sum(((predict(theFit,data.frame(x=xNew_unnorm-tol2nd,z=zNew))-2*predict(theFit,data.frame(x=xNew_unnorm,z=zNew))+predict(theFit,data.frame(x=xNew_unnorm+tol2nd,z=zNew)))/tol2nd^2)<0)
+    if(number>0){
+      theFitInitial<-gam(y~te(x,z,bs=c("ps","ps"),m=m,k=myK),drop.intercept=F )
+      coefMatrix<-matrix(coefficients(theFit),ncol  = myK[1])
+      
+      Dmatrix<-matrix(0,nrow  = myK[1],ncol=myK[2])
+      for(i in 1:(nrow(coefMatrix)-2)){
+        Dmatrix[i+1,c((i):(i+2))]<-c(1,-2,1)
+        
+      }
+      Dmatrix<-t(Dmatrix)
+      
+      value<-diag(as.numeric(colSums( Dmatrix* matrix(coefficients(theFit),nrow  = myK[1]))<0))
+      theFit<-gam(y~te(x,z,bs=c("ps","ps"),m=m,k=myK),drop.intercept=F,paraPen =list(x=list(sp=value)) ) # penalize on x only ? sp: a vector of smoothing parameter values
+    }
+    
+    yPred<-as.numeric(predict(theFit,data.frame(x=x,z=z)))
+    
+    Fit<-as.numeric(predict(theFit,data.frame(x=xNew_unnorm,z=zNew)))
+    
+    ##Estimate the First derivative fit
+    #Derv1Fit<--(predict(theFit,data.frame(x=xNew_unnorm,z=zNew))-predict(theFit,data.frame(x=xNew_unnorm+tol1st,z=zNew)))/tol1st
+    
+    ##Estimate the Second derivative fit
+    #Derv2FitNonNeg<-(predict(theFit,data.frame(x=xNew_unnorm-tol2nd,z=zNew))-2*predict(theFit,data.frame(x=xNew_unnorm,z=zNew))+predict(theFit,data.frame(x=xNew_unnorm+tol2nd,z=zNew)))/tol2nd^2
+    #
+    
+  }
+  lambdaValues<-theFit$sp
+
+  
+  ##data returned (AT: return origx = x where z is the input(normalized moneyness))
+  if(if_pred_new == TRUE){ # AT: newX and newX_unnorm both set to xNew_unnorm
+    return(list(origY=y,origX=x,origZ=z,fitOrig=yPred,
+                newX = xNew_unnorm, newX_unnorm = xNew_unnorm, newZ=zNew,
+                Fit=Fit, int.knots=knots, model_new=theFit_new)) # model=theFit is the insample fit model
+  }else{
+    return(list(origY=y,origX=x,origZ=z,fitOrig=yPred,
+                int.knots=knots,
+                model=theFit))
+  }
+}
+```
+
+
+### fit_BT_cur_func
+
+```{r}
+fit_BT_cur_func <- function(dat, if_pred_new = FALSE){
+  
+  # # extract m_l_unnorm_min, m_l_unnorm_max for current date
+  m_l_unnorm_min = min(dat$moneyness)
+  m_l_unnorm_max = max(dat$moneyness)
+  mLim = c(m_l_unnorm_min, m_l_unnorm_max)
+  tauLim = c(0, 1)
+
+  # # if manually specify the range for fine grids
+  # mLim = c(0.5,1.5)
+  # tauLim = c(0, 0.6)
+  
+
+  # finer grids in real data as well ? 
+  new_X_Z_grid = c(200, 365) # X for moneyness, Z for tau 
+
+
+  tol2nd = 5e-05
+  # AT: x,z are two covariates in this function
+  # use default penalty penalty = c(1,1) 
+  # fit un normalized moneyness  moneyness_nor
+  ls_fit_tensor_yu <- fitBTPS_zc_unnorm_test2_v2(y = dat$implied_vol, x = dat$moneyness, z = dat$ptmday_frac,
+                                                 xz = dat$moneyness* dat$ptmday_frac,
+                                                 knots = knots_K, degree = degree_m,
+                                                 tol2nd = tol2nd, newXLim = mLim, newZLim = tauLim,
+                                                 new_X_Z_grid = new_X_Z_grid,
+                                                 if_pred_new = if_pred_new)
+  
+  if(if_pred_new == FALSE){
+  # return [[1]] the coefficients , [[2]]the model matrix (basis matrix), [[3]]and the dataframe that include response, predicted response, predictor ptmday)
+    return(list(ls_fit_tensor_yu$model$coefficients, 
+                model.matrix(ls_fit_tensor_yu$model),
+                
+                data.frame(trade_date = dat$trade_date, ptmday = dat$ptmday, 
+                           exercise_price = dat$exercise_price, etfprice = dat$etfprice, 
+                           call_or_put = dat$call_or_put, close = dat$close, volume = dat$volume,
+                           interest_rate = dat$interest_rate, 
+                           implied_vol = ls_fit_tensor_yu$origY, moneyness = ls_fit_tensor_yu$origX), 
+                data.frame(newX_unnorm = ls_fit_tensor_yu$newX_unnorm, newZ = ls_fit_tensor_yu$newZ, Fit = ls_fit_tensor_yu$Fit)
+              ))  
+    
+  }else{
+    # for out-of-sample fine grid (surface)
+    # return the fine grids and its corresponding model matrix (from model_new)
+    return(
+      list(data.frame(newX_unnorm = ls_fit_tensor_yu$newX_unnorm, newZ = ls_fit_tensor_yu$newZ), 
+           model.matrix(ls_fit_tensor_yu$model_new))
+    )
+  }
+
+}
+
+```
+
+### day_out_put_func
+```{r}
+# INPUT: alpha_pred_df: the predicted alpha on the testing period
+day_out_put_func <- function(date_cur_pred, df_real_merge_trans_f, alpha_pred_df, if_pred_new){
+  df_cur_s = df_real_merge_trans_f %>% filter(trade_date == date_cur_pred)
+
+  # purpose: for plot the 3D surface for a specific date later
+  if(if_pred_new == TRUE){
+    print(df_cur_s)
+    return(fit_BT_cur_func(df_cur_s, if_pred_new)[[4]])
+    }
+  
+  # browser()
+  # print(df_cur_s)
+  # subtract the correspoding predicted alphas for that date
+  alpha_pred_entry <- (alpha_pred_df %>% dplyr::filter(trade_date == date_cur_pred))[-1] # remove the date
+  
+  # browser()
+  # create the bsplines for moneyness for that date from the fit_BT_cur_func() output
+  bsplines_cur_df <- df_cur_s %>% 
+    # group_by(ptmday) %>%  # surface now : not curve wise
+    do(data.frame(matrix(fit_BT_cur_func(.,if_pred_new)[[2]], ncol = 1 + 2*(knots_K + degree_m + 1 - 1)
+                           ))) %>% 
+    ungroup() 
+  
+  
+  # get the prediction for each ptmday level in that date 
+  IV_pred_cur_l <- as.matrix(bsplines_cur_df) %*% t(as.matrix(alpha_pred_entry))
+  
+  
+  # prepare the dataframe for plot (AT: order of the prediction should match the origianl obs: use fit_BT_cur_func())
+  output_cur_df <- df_cur_s %>% 
+    # group_by(ptmday) %>% 
+    do(fit_BT_cur_func(.,if_pred_new)[[3]]) %>% ungroup() 
+  
+  output_cur_df['implied_vol_pred'] <-  IV_pred_cur_l 
+  
+  return(output_cur_df)
+
+  }
+```
+
+
+
+## Splines and derivatives
+
+### try
+
+```{r}
+tmp <- smoothCon(s(moneyness, bs="bs",m=m,k=myK), data = df_cur_s, absorb.cons = TRUE)
+
+Xmat <- smoothCon(s(moneyness, bs="bs", m=m, k=myK),
+                  data = data.frame(moneyness = xNew_unnorm),
+                  absorb.cons = TRUE)[[1]]
+Xmat2 <- smoothCon(s(moneyness, bs="bs", m=m, k=myK),
+                  data = dat, dataX = data.frame(moneyness=hold.dataframe$Var1), n=400,
+                  absorb.cons = TRUE)[[1]]
+Xmat3 <- PredictMat(Xmat, data = hold.dataframe)
+
+# validate predict matrix
+Xorg <- smoothCon(s(moneyness, bs="bs", m=m, k=myK),
+                    data = df_cur_s,
+                    absorb.cons = TRUE)[[1]]
+Xorg2 <- smoothCon(s(moneyness, bs="bs", m=m, k=myK),
+                    data = hold.dataframe,
+                    absorb.cons = TRUE)[[1]]
+Xmat <- PredictMat(Xorg, data = data.frame(moneyness=hold.dataframe$moneyness))
+
+Xmat <- PredictMat(Xorg, data = df_cur_s)
+Xmat2 <- PredictMat(Xorg2, data = df_cur_s)
+  
+Zorg <- smoothCon(s(ptmday_frac, bs="bs", m=m, k=myK),
+                  data = df_cur_s,
+                  absorb.cons = TRUE)[[1]]
+Zmat <- PredictMat(Zorg, data = hold.dataframe)
+
+
+xNew_unnorm<-hold.dataframe[,1]
+zNew<-hold.dataframe[,2]
+#used to compare with Zihao's code
+Fit<-as.numeric(predict(theFit,data.frame(x=xNew_unnorm,z=zNew))) # use ptmday_frac now for both simu and real data
+
+#For the purpose of getting model matrix for the fine grids
+#Warning(YL): the knots for z of from theFit_new are NOT consistent with the_Fit (the range changes) 
+theFit_new <- gam(Fit~s(xNew_unnorm, k = myK, m = m, bs = "bs") + s(zNew, k = myK, m = m, bs="bs"), drop.intercept=F)
+  
+```
+
+
+### Output
+
+```{r}
+test_date_l <- alpha_pred_df$trade_date
+# pick a date
+test_date_l <- alpha_pred_df$trade_date[966]  #2019-05-24
+#test_date_l <- alpha_pred_df$trade_date[148] #2016-02-24
+#test_date_l <- alpha_pred_df$trade_date[910]  #2019-03-06
+
+
+#output_df <- data.frame()
+
+for(i in c(1:length(test_date_l))){
+  date_cur_pred <- test_date_l[i]
+  df_cur_s = df_real_merge_trans_f %>% filter(trade_date == date_cur_pred)
+  St_cur <- df_cur_s$etfprice[1]
+  r <- df_cur_s$price_1m[1] #need some adjustment for future use(a separate form for several specific date)
+
+  #extract alpha
+  alpha_pred_entry <- (alpha_pred_df %>% dplyr::filter(trade_date == date_cur_pred))[-1] # remove the date
+
+  #extract m_l_unnorm_min, m_l_unnorm_max for current date
+  mLim <- range(df_cur_s$moneyness)
+  tauLim = c(0, 1)
+  tauFix = c(7, 14, 28, 60)
+  new_X_Z_grid = c(200, 365)
+  
+  #create new data and fit the new data
+  xNew_unnorm<-seq(newXLim[1],newXLim[2],length.out = new_X_Z_grid[1])
+  zNew <- tauFix/new_X_Z_grid[2]
+  
+  #try this(same result)
+  #hold.dataframe <- df_cur_s[,c('moneyness', 'ptmday_frac')]
+  
+  hold.dataframe<-expand.grid(xNew_unnorm,zNew)
+  colnames(hold.dataframe) <- c('moneyness', 'ptmday_frac')
+  
+  #extract s(x) and s(z) on the original grid and generate new splines
+  Xorg <- smoothCon(s(moneyness, bs="bs", m=m, k=myK),
+                    data = df_cur_s,
+                    absorb.cons = TRUE)[[1]]
+  Xmat <- PredictMat(Xorg, data = hold.dataframe)
+  
+  Zorg <- smoothCon(s(ptmday_frac, bs="bs", m=m, k=myK),
+                    data = df_cur_s,
+                    absorb.cons = TRUE)[[1]]
+  Zmat <- PredictMat(Zorg, data = hold.dataframe)
+  
+  #extract derivatives
+  delta.1 <- .000001
+  delta.2 <- .00001
+  Xmatd1 <-  PredictMat(Xorg, data = data.frame(moneyness = hold.dataframe$moneyness+delta.1))
+  Xmatd2_pos <-  PredictMat(Xorg, data = data.frame(moneyness = hold.dataframe$moneyness+delta.2))
+  Xmatd2_neg <-  PredictMat(Xorg, data = data.frame(moneyness = hold.dataframe$moneyness-delta.2))
+  ##Estimate the First derivative fit
+  alpha_X <- alpha_pred_entry[2:7]
+  hold.dataframe$Dev1 <- ((Xmatd1-Xmat) %*% t(alpha_X)) / delta.1 #[y(m+d1)-y(m)]/d1
+  hold.dataframe$Dev2 <- ((Xmatd2_pos + Xmatd2_neg - 2*Xmat) %*% t(alpha_X)) / (delta.2^2) #[y(m+d1)+y(m-d1)-2y(m)]/d2^2
+
+  #additive bs: combine columns
+  bspline_cur <- data.frame(cbind(rep(1, dim(hold.dataframe)[1]),
+                                  Xmat, Zmat))
+  
+  #collect result
+  hold.dataframe$g_pred <- as.matrix(bspline_cur) %*% t(as.matrix(alpha_pred_entry))
+  hold.dataframe <- hold.dataframe %>% 
+    mutate(IV_pred = exp(g_pred),
+           strike = moneyness*St_cur*exp(r*ptmday_frac), 
+           d.1 = (-log(moneyness)/(IV_pred*sqrt(ptmday_frac)))+0.5*IV_pred*sqrt(ptmday_frac), #S_t/K = -(log(m)+rtau)
+           d.2 = d.1 - IV_pred*ptmday_frac,
+           A = dnorm(x = d.1),
+           B = IV_pred*Dev1,
+           C = 1/(St_cur*exp(r*ptmday_frac)),
+           pdpK.1 = -1/(strike*IV_pred*sqrt(ptmday_frac))+(sqrt(ptmday_frac)-d.1/IV_pred)*B*C,
+           pdpK.2 = pdpK.1 - sqrt(ptmday_frac)*B*C,
+           A.prime = -A*d.1*pdpK.1,
+           B.prime = IV_pred*Dev1*(Dev1^2+Dev2)*C)
+  
+  ## f = A'B+AB'-\phi(d_2)*pdpK.2
+  hold.dataframe <- hold.dataframe %>% 
+    mutate(density = sqrt(ptmday_frac) * (A.prime*B + A*B.prime) - dnorm(x = d.2)*pdpK.2)
+  
+  #output_df <- rbind(output_df, output_cur_df)
+
+}
+```
+
+```{r}
+#create several plots
+mLim_cur <- output_df %>% filter(ptmday==14 & trade_date==date_cur_pred) %>% select(moneyness) %>% range
+
+#target tau=10: ghat and density/truncated or not
+p1 <- hold.dataframe %>%
+  filter(ptmday_frac==14/365) %>%
+  #filter(0.91<moneyness) %>%
+  ggplot(aes(x=strike, y=density))+geom_point()+
+  geom_vline(aes(xintercept=St_cur)) +
+  labs(title = "predicted Q density", x="S")
+
+p2 <- hold.dataframe %>%
+  filter(ptmday_frac==14/365) %>%
+  filter(mLim_cur[1]<moneyness) %>%
+  ggplot(aes(x=strike, y=density))+geom_point() +
+  ylim(-0.003, 0.008) +
+  labs(title = "predicted Q density: truncated", x="S")
+  
+p3 <- hold.dataframe %>%
+  filter(ptmday_frac==14/365) %>%
+  ggplot(aes(x=moneyness, y=g_pred))+geom_point() +
+  ylim(-2.5, -1.5) +
+  labs(title = "predicted IV", y=expression(log(sigma)))
+
+p4 <- hold.dataframe %>%
+  filter(ptmday_frac==14/365) %>%
+  filter(mLim_cur[1]<moneyness) %>%
+  ggplot(aes(x=moneyness, y=g_pred))+geom_point()+
+  labs(title = "predicted IV: truncated", y=expression(log(sigma)))
+
+p1+p2+p3+p4
+p1
+```
+
+```{r}
+#another group with larger tau
+mLim_cur <- output_df %>% filter(ptmday==30 & trade_date==date_cur_pred) %>% select(moneyness) %>% range
+
+#target tau=10: ghat and density/truncated or not
+p1 <- hold.dataframe %>%
+  filter(ptmday_frac==28/365) %>%
+  #filter(0.91<moneyness) %>%
+  ggplot(aes(x=strike, y=density))+geom_point()+
+  ylim(-0.009, 0.008) +
+  labs(title = "predicted Q density", x="S")
+
+p2 <- hold.dataframe %>%
+  filter(ptmday_frac==28/365) %>%
+  filter(mLim_cur[1]<moneyness) %>%
+  ggplot(aes(x=strike, y=density))+geom_point() +
+  ylim(-0.009, 0.008) +
+  labs(title = "predicted Q density: truncated", x="S")
+  
+p3 <- hold.dataframe %>%
+  filter(ptmday_frac==28/365) %>%
+  ggplot(aes(x=moneyness, y=g_pred))+geom_point() +
+  ylim(-2.5, -1.5) +
+  labs(title = "predicted IV", y=expression(log(sigma)))
+
+p4 <- hold.dataframe %>%
+  filter(ptmday_frac==28/365) %>%
+  filter(mLim_cur[1]<moneyness) %>%
+  ggplot(aes(x=moneyness, y=g_pred))+geom_point()+
+  ylim(-2.5, -1.5) +
+  labs(title = "predicted IV: truncated", y=expression(log(sigma)))
+
+p1+p2+p3+p4
+```
+
+
+```{r}
+  hold.dataframe %>%
+    filter(ptmday_frac==30/365) %>%
+    ggplot(aes(x=moneyness, y=g_pred))+geom_point()
+
+
+  output_df %>%
+    filter(trade_date == date_cur_pred) %>%
+    filter(ptmday==round(quantile(ptmday, probs=(0.75)))) %>%
+    ggplot(aes(x=moneyness, y=implied_vol_pred))+geom_point()
+  
+  output_df %>%
+    filter(trade_date == date_cur_pred) %>%
+    filter(ptmday==15) %>%
+    ggplot(aes(x=moneyness, y=implied_vol_pred))+geom_point()
+```
+
+```{r}
+# whether the density is valid
+t <- hold.dataframe %>%
+  filter(ptmday_frac==30/365) %>%
+  filter(0.99<moneyness) %>%
+  select(density)
+
+s <- hold.dataframe %>%
+  filter(ptmday_frac==30/365) %>%
+  filter(0.99<moneyness) %>%
+  select(strike)
+
+t(diff(as.matrix(s))) %*% as.matrix(t[-1,])
+```
+
+```{r}
+# some summary
+a1 <- df_real_merge_trans_f %>%
+  group_by(ptmday) %>%
+  summarise(min=min(moneyness), max = max(moneyness)) %>%
+  ggplot(aes(x = ptmday, y=min)) + geom_point() +
+  labs(x=expression(tau), y="min")
+
+a2 <- df_real_merge_trans_f %>%
+  group_by(ptmday) %>%
+  summarise(min=min(moneyness), max = max(moneyness)) %>%
+  ggplot(aes(x = ptmday, y=max)) + geom_point() +
+  labs(x=expression(tau), y="max")
+
+a1+a2
+```
+
